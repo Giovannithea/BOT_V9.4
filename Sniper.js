@@ -1,48 +1,106 @@
+const { Connection, PublicKey, Keypair } = require('@solana/web3.js');
+const { swapTokens } = require('./swapCreator');
+const bs58 = require('bs58');
+const { MongoClient } = require('mongodb');
+require('dotenv').config();
+
 class Sniper {
-    constructor(config) {
-        this.baseToken = config.baseToken;
-        this.targetToken = config.targetToken;
-        this.buyAmount = config.buyAmount;
-        this.sellTargetPrice = config.sellTargetPrice;
-        this.tokenData = config.tokenData;
+    constructor(cfg, fullLpData = null) {
+        // ---------- 1.  minimal runtime state ----------
+        Object.assign(this, cfg);          // tokenId, ammId, K, V, etc.
+        this.buyAmount        = cfg.buyAmount;
+        this.targetMultiplier = 1 + cfg.sellTargetPrice / 100;
+        this.calculatedSell   = cfg.V * this.targetMultiplier;
+
+        // ---------- 2.  Infra ----------
+        this.owner      = Keypair.fromSecretKey(bs58.default.decode(process.env.WALLET_PRIVATE_KEY));
+        this.connection = new Connection(process.env.SOLANA_WS_URL || process.env.SOLANA_RPC_URL, 'confirmed');
+
+        // ---------- 3.  Phase flags ----------
+        this.fullLpData = fullLpData;      // cleared after buy
+        this.vaultSubId = null;
+        this.db         = null;
     }
 
-    setBuyAmount(amount) {
-        this.buyAmount = amount;
+    /* ------------ BUY ONCE ---------------- */
+    async executeBuy() {
+        if (!this.fullLpData) throw new Error('LP data missing for buy phase');
+        console.log(`[BUY] Swapping ${this.buyAmount} quote tokens for base`);
+
+        await swapTokens({
+            lpData: this.fullLpData,
+            amountSpecified: this.toLamports(this.buyAmount, this.quoteDecimals),
+            swapBaseIn: false,
+            owner: this.owner
+        });
+
+        // Free memory
+        this.fullLpData = null;
     }
 
-    setSellTargetPrice(price) {
-        this.sellTargetPrice = price;
+    /* ------------ LIVE PRICE WATCHER ---------------- */
+    async subscribeToVault() {
+        const quoteVault = new PublicKey(this.quoteVault);   // pc / quote side
+        this.vaultSubId = this.connection.onAccountChange(
+            quoteVault,
+            async ({ lamports }) => {
+                const balance   = lamports / 10 ** this.quoteDecimals;
+                const priceNow  = balance / (this.K / balance); // x*y = K  :contentReference[oaicite:2]{index=2}
+                console.log(`[PRICE] ${this.baseMint.slice(0,4)}: ${priceNow}`);
+
+                if (priceNow >= this.calculatedSell) {
+                    await this.executeSell();
+                    await this.unsubscribe();
+                }
+            },
+            'confirmed'
+        );
+        console.log(`[SUB] Watching vault ${this.quoteVault}`);
     }
 
-    async watchPrice() {
-        console.log(`Watching price for target token: ${this.targetToken}`);
-        const intervalId = setInterval(async () => {
-            const currentPrice = await this.getCurrentPrice(); // Replace with actual price fetching logic
-            console.log(`Current price of ${this.targetToken}: ${currentPrice}`);
-            if (currentPrice >= this.sellTargetPrice) {
-                await this.sellToken();
-                clearInterval(intervalId);  // Stop watching price after selling
-            }
-        }, 60000); // Check price every 60 seconds
+    async unsubscribe() {
+        if (this.vaultSubId) {
+            await this.connection.removeAccountChangeListener(this.vaultSubId);
+            this.vaultSubId = null;
+        }
     }
 
-    async getCurrentPrice() {
-        // Replace this mock logic with actual logic to fetch current price
-        return Math.random() * 100;
+    /* ------------ SELL ---------------- */
+    async executeSell() {
+        // pull fresh LP doc (we cleared it after buy)
+        const lpData = await this.fetchFromMongo();
+        console.log(`[SELL] price target hit – exiting position`);
+
+        await swapTokens({
+            lpData,
+            amountSpecified: await this.getTokenBalance(),
+            swapBaseIn: true,
+            owner: this.owner
+        });
     }
 
-    async buyToken() {
-        console.log(`Buying ${this.buyAmount} of target token: ${this.targetToken}`);
-        await new Promise(resolve => setTimeout(resolve, 1000)); // Simulate buy delay
-        console.log(`Bought ${this.buyAmount} of ${this.targetToken}`);
+    /* ------------ HELPERS ---------------- */
+    async fetchFromMongo() {
+        if (!this.db) {
+            const cli = new MongoClient(process.env.MONGO_URI);
+            await cli.connect();
+            this.db = cli.db('bot');
+        }
+        return this.db.collection('raydium_lp_transactionsV3')
+            .findOne({ _id: this.tokenId });
     }
 
-    async sellToken() {
-        console.log(`Selling target token: ${this.targetToken} when price reaches: ${this.sellTargetPrice}`);
-        await new Promise(resolve => setTimeout(resolve, 1000)); // Simulate sell delay
-        console.log(`Sold ${this.targetToken} at target price: ${this.sellTargetPrice}`);
+    async getTokenBalance() {
+        const res = await this.connection.getTokenAccountsByOwner(
+            this.owner.publicKey,
+            { mint: new PublicKey(this.baseMint) }
+        );
+        if (res.value.length === 0) return 0;
+        const bal = await this.connection.getTokenAccountBalance(res.value[0].pubkey);
+        return bal.value.amount;
     }
+
+    toLamports(x, dec) { return Math.floor(x * 10 ** dec); }
 }
 
 module.exports = Sniper;
