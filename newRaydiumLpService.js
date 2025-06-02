@@ -1,21 +1,31 @@
-const { Connection, PublicKey } = require("@solana/web3.js");
-const { MongoClient } = require("mongodb");
+/*──────────────────────────────────────────────────────────────
+  newRaydiumLpService.js  –  BOT 9.3
+  One‑hop, in‑memory return flow **while still persisting every
+  LP document to MongoDB**.  We now pass the Mongo _id back as
+  `tokenId` and leave the rest of the object untouched.
+──────────────────────────────────────────────────────────────*/
+
+const { Connection, PublicKey, Keypair } = require("@solana/web3.js");
+const { MongoClient }          = require("mongodb");
+const bs58                     = require("bs58");
+const { getAssociatedTokenAddressSync } = require("@solana/spl-token");
 require("dotenv").config();
 
-const connection = new Connection(process.env.SOLANA_WS_URL, "confirmed");
-const RAYDIUM_AMM_PROGRAM_ID = new PublicKey(process.env.RAYDIUM_AMM_PROGRAM_ID);
-const SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"; // Solana System Program ID
-const TOKEN_PROGRAM_ID_STR = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"; // Token Program ID
-const ASSOCIATED_TOKEN_PROGRAM_ID_STR = "ATokenGPv1sfdS5qUnx9GbS6hX1TTjR1L6rT3HaZJFA"; // Associated Token Program ID
+// ──────────────────────────────────────────────────────────
+// Constants / singletons
+const connection               = new Connection(process.env.SOLANA_WS_URL, "confirmed");
+const RAYDIUM_AMM_PROGRAM_ID   = new PublicKey(process.env.RAYDIUM_AMM_PROGRAM_ID);
+const SYSTEM_PROGRAM_ID        = "11111111111111111111111111111111";
+const TOKEN_PROGRAM_ID_STR     = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const ASSOCIATED_TOKEN_PROGRAM_ID_STR = "ATokenGPv1sfdS5qUnx9GbS6hX1TTjR1L6rT3HaZJFA";
+const WSOL_MINT               = "So11111111111111111111111111111112";
 
+// ──────────────────────────────────────────────────────────
+// Mongo helpers
 let db;
 
 async function connectToDatabase() {
-    const mongoUri = process.env.MONGO_URI;
-    const client = new MongoClient(mongoUri, {
-        useNewUrlParser: true,
-        useUnifiedTopology: true,
-    });
+    const client = new MongoClient(process.env.MONGO_URI);
     try {
         await client.connect();
         db = client.db("bot");
@@ -27,118 +37,151 @@ async function connectToDatabase() {
 }
 
 async function saveToMongo(tokenData) {
+    if (!db) throw new Error("Database connection not initialized");
+    const result = await db.collection("raydium_lp_transactionsV3").insertOne(tokenData);
+    console.log("Saved document with ID:", result.insertedId);
+    return result;           // { acknowledged, insertedId }
+}
+
+// ──────────────────────────────────────────────────────────
+// Binary helpers
+function parseCreateAmmLpParams(data) {
+    return {
+        discriminator : data.readUInt8(0),
+        nonce         : data.readUInt8(1),
+        openTime      : data.readBigUInt64LE(2).toString(),
+        initPcAmount  : data.readBigUInt64LE(10).toString(),
+        initCoinAmount: data.readBigUInt64LE(18).toString(),
+    };
+}
+
+async function fetchMarketAccountsFromChain(marketId) {
     try {
-        if (!db) {
-            throw new Error("Database connection is not initialized");
-        }
-        const collection = db.collection("raydium_lp_transactions");
-        const result = await collection.insertOne(tokenData);
+        const info = await connection.getAccountInfo(new PublicKey(marketId));
+        if (!info || info.data.length < 341) return null;
 
-        if (result.acknowledged) {
-            console.log("Token data saved to MongoDB:", result.insertedId);
-        } else {
-            console.error("Failed to save token data to MongoDB.");
-        }
-    } catch (error) {
-        console.error("Error saving token data to MongoDB:", error.message);
+        const d = info.data;
+        return {
+            marketEventQueue: new PublicKey(d.subarray(245, 277)).toString(),
+            marketBids      : new PublicKey(d.subarray(277, 309)).toString(),
+            marketAsks      : new PublicKey(d.subarray(309, 341)).toString(),
+        };
+    } catch (err) {
+        console.error("Error fetching market account:", err.message);
+        return null;
     }
 }
 
-function invertCoinAndPcMint(tokenData) {
-    const SPECIAL_COIN_MINT = "So11111111111111111111111111111111111111112";
-    if (tokenData.coinMint === SPECIAL_COIN_MINT) {
-        [tokenData.coinMint, tokenData.pcMint] = [tokenData.pcMint, tokenData.coinMint];
-    }
-    return tokenData;
-}
-
+// ──────────────────────────────────────────────────────────
+// ———————————————  MAIN ENTRY  ———————————————
 async function processRaydiumLpTransaction(connection, signature) {
     try {
-        // Fetch the transaction details with new version handling
-        const transactionDetails = await connection.getTransaction(signature, {
+        const tx = await connection.getTransaction(signature, {
             commitment: "confirmed",
             maxSupportedTransactionVersion: 0,
         });
+        if (!tx) { console.error("No transaction details found:", signature); return null; }
 
-        if (!transactionDetails) {
-            console.error("No transaction details found for signature:", signature);
-            return;
-        }
+        const msg      = tx.transaction.message;
+        const accounts = (msg.staticAccountKeys ?? msg.accountKeys).map(k => k.toString());
+        const instrs   = msg.compiledInstructions || msg.instructions;
+        if (!instrs) { console.error("No instructions found"); return null; }
 
-        // Updated way to access transaction data
-        const message = transactionDetails.transaction.message;
-
-        // For newer versions of Solana
-        const accounts = message.staticAccountKeys
-            ? message.staticAccountKeys.map((key) => key.toString())
-            : message.accountKeys.map((key) => key.toString());
-
-        const instructions = message.compiledInstructions || message.instructions;
-
-        if (!instructions) {
-            console.error("No instructions found in transaction");
-            return;
-        }
-
-        console.log("Transaction Message:", message);
-        console.log("Accounts:", accounts);
-
-        // Process each instruction
-        for (const ix of instructions) {
+        for (const ix of instrs) {
             const programId = accounts[ix.programIdIndex];
+            if (programId !== RAYDIUM_AMM_PROGRAM_ID.toString() || ix.data.length === 0) continue;
 
-            if (programId === RAYDIUM_AMM_PROGRAM_ID.toString() && ix.data.length > 0) {
-                // Extract account indices (adjusted for possible different structure)
-                const accountIndices = ix.accounts || ix.accountKeyIndexes;
+            const accIdx = ix.accounts || ix.accountKeyIndexes;
+            if (!accIdx) { console.error("No account indices"); continue; }
 
-                if (!accountIndices) {
-                    console.error("No account indices found in instruction");
-                    continue;
-                }
+            const params         = parseCreateAmmLpParams(Buffer.from(ix.data, "base64"));
+            const indexed        = {
+                programId       : accounts[accIdx[0]],
+                ammId           : accounts[accIdx[4]],
+                ammAuthority    : accounts[accIdx[5]],
+                ammOpenOrders   : accounts[accIdx[6]],
+                lpMint          : accounts[accIdx[7]],
+                baseMint        : accounts[accIdx[8]],
+                quoteMint       : accounts[accIdx[9]],
+                baseVault       : accounts[accIdx[10]],
+                quoteVault      : accounts[accIdx[11]],
+                ammTargetOrders : accounts[accIdx[13]],
+                deployer        : accounts[accIdx[17]],
+                marketProgramId : accounts[accIdx[15]],
+                marketId        : accounts[accIdx[16]],
+                marketBaseVault : accounts[accIdx[18]],
+                marketQuoteVault: accounts[accIdx[19]],
+                marketAuthority : accounts[accIdx[20]],
+            };
 
-                const mint0 = accounts[accountIndices[8]]; // Base token mint
-                const mint1 = accounts[accountIndices[9]]; // Quote token mint
-                const lpTokenMint = accounts[accountIndices[7]]; // LP token mint
-                const deployer = accounts[accountIndices[17]]; // Deployer's address
-                const poolId = accounts[accountIndices[4]]; // AMM pool ID
-                const baseVault = accounts[accountIndices[10]]; // Base token vault
-                const quoteVault = accounts[accountIndices[11]]; // Quote token vault
-                const ammAuthority = accounts[accountIndices[5]]; // AMM authority
-                const ammTarget = accounts[accountIndices[13]]; // AMM target orders
-                const ammOpenOrder = accounts[accountIndices[6]]; // AMM open orders
+            let tokenData = {
+                programId         : RAYDIUM_AMM_PROGRAM_ID.toString(),
+                ammId             : indexed.ammId,
+                ammAuthority      : indexed.ammAuthority,
+                ammOpenOrders     : indexed.ammOpenOrders,
+                lpMint            : indexed.lpMint,
+                baseMint          : indexed.baseMint,
+                quoteMint         : indexed.quoteMint,
+                baseVault         : indexed.baseVault,
+                quoteVault        : indexed.quoteVault,
+                ammTargetOrders   : indexed.ammTargetOrders,
+                deployer          : indexed.deployer,
+                marketProgramId   : indexed.marketProgramId,
+                marketId          : indexed.marketId,
+                marketBaseVault   : indexed.marketBaseVault,
+                marketQuoteVault  : indexed.marketQuoteVault,
+                marketAuthority   : indexed.marketAuthority,
+                systemProgramId   : SYSTEM_PROGRAM_ID,
+                tokenProgramId    : TOKEN_PROGRAM_ID_STR,
+                associatedTokenProgramId: ASSOCIATED_TOKEN_PROGRAM_ID_STR,
+                initPcAmount      : params.initPcAmount,
+                initCoinAmount    : params.initCoinAmount,
+                K                 : (BigInt(params.initPcAmount) * BigInt(params.initCoinAmount)).toString(),
+                V                 : (
+                    Math.min(Number(params.initPcAmount), Number(params.initCoinAmount)) /
+                    Math.max(Number(params.initPcAmount), Number(params.initCoinAmount))
+                ).toString(),
+                isWSOLSwap        : indexed.baseMint === WSOL_MINT,
+                wrappedSOLAmount  : indexed.baseMint === WSOL_MINT ? params.initCoinAmount : null,
+                fee               : "0.003",
+                token             : indexed.baseMint,
+                baseDecimals      : 9,
+                quoteDecimals     : 9,
+                version           : "V2",
+                marketVersion     : "V2",
+                serumProgramId    : indexed.marketProgramId,
+                serumMarket       : indexed.marketId,
+                serumBids         : null,
+                serumAsks         : null,
+                serumEventQueue   : null,
+            };
 
-                let tokenData = {
-                    programId: new PublicKey(accounts[accountIndices[0]]).toString(), // Raydium AMM Program ID
-                    ammId: new PublicKey(poolId).toString(), // AMM Pool Account
-                    ammAuthority: new PublicKey(ammAuthority).toString(), // AMM Authority Account
-                    ammOpenOrders: new PublicKey(ammOpenOrder).toString(),
-                    lpMint: new PublicKey(lpTokenMint).toString(), // LP Token Mint
-                    coinMint: new PublicKey(mint0).toString(), // Base Token Mint
-                    pcMint: new PublicKey(mint1).toString(), // Quote Token Mint
-                    coinVault: new PublicKey(baseVault).toString(), // Base Token Vault
-                    pcVault: new PublicKey(quoteVault).toString(), // Quote Token Vault
-                    ammTargetOrders: new PublicKey(ammTarget).toString(),
-                    deployer: new PublicKey(deployer).toString(), // Deployer's Address
-                    systemProgramId: SYSTEM_PROGRAM_ID, // System Program ID
-                    tokenProgramId: TOKEN_PROGRAM_ID_STR, // Token Program ID
-                    associatedTokenProgramId: ASSOCIATED_TOKEN_PROGRAM_ID_STR, // Associated Token Program ID
-                };
+            // ── Pull Serum side‑accounts for full context ──
+            const marketAccounts = await fetchMarketAccountsFromChain(tokenData.marketId);
+            if (!marketAccounts) throw new Error("Missing critical market data for V2 swaps");
 
-                tokenData = invertCoinAndPcMint(tokenData);
+            tokenData = { ...tokenData, ...marketAccounts };
 
-                await saveToMongo(tokenData);
-                return tokenData;
-            }
+            console.log(
+                "Full token data structure (sanitized):",
+                JSON.stringify({ ...tokenData, tokenId: "REDACTED" }, null, 2)
+            );
+
+            // ── Persist & return – one hop, no extra processing ──
+            const { insertedId } = await saveToMongo(tokenData);
+            return { ...tokenData, tokenId: insertedId };  // ⭐ add tokenId & hand straight back
         }
-    } catch (error) {
-        if (error.message.includes("Cannot read properties of undefined (reading '_bn')")) {
-            console.log("Encountered '_bn' error, ignoring transaction:", signature);
+    } catch (err) {
+        if (err.message.includes("Cannot read properties of undefined (reading '_bn')")) {
+            console.log("Skipping problematic transaction:", signature);
         } else {
-            console.error("Error fetching/processing transaction:", error.message);
+            console.error("Processing error:", err.message);
         }
+        return null;
     }
 }
 
+// ──────────────────────────────────────────────────────────
 module.exports = {
     connectToDatabase,
     processRaydiumLpTransaction,
